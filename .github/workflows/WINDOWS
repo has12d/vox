@@ -1,0 +1,209 @@
+# .github/workflows/windows-x64.yml
+name: windows-x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    env:
+      V_REVISION: 7ede4c6133d71f88ab99e68fd9626552e252ad3a
+      WEBKIT_REVISION: '2395'
+      DEPS: ${{ github.workspace }}/Build/deps/windows
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config mingw-w64 \
+            curl ca-certificates unzip zstd p7zip-full python3
+
+      - name: Swap for the single-file C build
+        run: |
+          sudo fallocate -l 8G "$RUNNER_TEMP/vox.swap"
+          sudo chmod 600 "$RUNNER_TEMP/vox.swap"
+          sudo mkswap "$RUNNER_TEMP/vox.swap"
+          sudo swapon "$RUNNER_TEMP/vox.swap"
+
+      - name: Build pinned V
+        run: |
+          git init "$RUNNER_TEMP/v"
+          git -C "$RUNNER_TEMP/v" remote add origin https://github.com/vlang/v.git
+          git -C "$RUNNER_TEMP/v" fetch --depth 1 origin "$V_REVISION"
+          git -C "$RUNNER_TEMP/v" checkout --detach FETCH_HEAD
+          make -C "$RUNNER_TEMP/v" CC=cc -j"$(nproc)"
+          printf 'V_BIN=%s/v\n' "$RUNNER_TEMP/v" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/v" >> "$GITHUB_PATH"
+
+      - name: Fetch UI2 and migrate its Windows integer spellings
+        run: |
+          git init "$RUNNER_TEMP/ui2"
+          git -C "$RUNNER_TEMP/ui2" remote add origin https://github.com/vlang/ui2.git
+          git -C "$RUNNER_TEMP/ui2" fetch --depth 1 origin HEAD
+          git -C "$RUNNER_TEMP/ui2" checkout --detach FETCH_HEAD
+          find "$RUNNER_TEMP/ui2" -name '*.v' -print0 \
+            | xargs -0 -r sed -i -E 's/\busize\b/uint/g; s/\bisize\b/int/g'
+          printf 'UI2_SOURCE_DIR=%s\n' "$RUNNER_TEMP/ui2" >> "$GITHUB_ENV"
+
+      - name: Optimize the C compile like the Linux production build
+        run: |
+          # The Linux entrypoint passes -cflags "-O2"; build_windows does not.
+          # Add the same optimization so the PE is not compiled at V's default.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tools/buildtools/development.v')
+          text = path.read_text()
+          old = "mut flags := ['-b', 'c', '-prod', '-no-prod-options']"
+          new = "mut flags := ['-b', 'c', '-prod', '-no-prod-options', '-cflags', '-O2']"
+          if old not in text:
+              raise SystemExit('development.v changed; update the patch')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          grep -q "'-cflags', '-O2'" tools/buildtools/development.v
+
+      - name: Windows sysroot from MSYS2 packages
+        run: |
+          python3 - "$DEPS" <<'PY'
+          import hashlib, re, subprocess, sys, tempfile, urllib.request
+          from pathlib import Path
+
+          REPO = 'https://repo.msys2.org/mingw/mingw64'
+          SEEDS = ['mingw-w64-x86_64-icu', 'mingw-w64-x86_64-harfbuzz',
+                   'mingw-w64-x86_64-freetype', 'mingw-w64-x86_64-openssl',
+                   'mingw-w64-x86_64-curl']
+
+          def fetch(url, timeout=300):
+              request = urllib.request.Request(url, headers={'User-Agent': 'vox-ci'})
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  return response.read()
+
+          def load_index():
+              with tempfile.TemporaryDirectory() as scratch:
+                  db = Path(scratch) / 'mingw64.db'
+                  db.write_bytes(fetch(f'{REPO}/mingw64.db'))
+                  subprocess.run(['tar', '--zstd', '-xf', str(db), '-C', scratch], check=True)
+                  index = {}
+                  for desc in Path(scratch).glob('*/desc'):
+                      fields, name = {}, None
+                      for block in desc.read_text(errors='replace').split('\n\n'):
+                          lines = [line for line in block.splitlines() if line]
+                          if not lines:
+                              continue
+                          if lines[0] == '%NAME%':
+                              name = lines[1]
+                          fields[lines[0]] = lines[1:]
+                      if name:
+                          index[name] = fields
+                  return index
+
+          root = Path(sys.argv[1]).resolve()
+          index = load_index()
+          queue, wanted, seen = list(SEEDS), [], set()
+          while queue:
+              name = queue.pop(0)
+              if name in seen:
+                  continue
+              seen.add(name)
+              package = index.get(name)
+              if package is None:
+                  print(f'warning: {name} is not in the mingw64 repository')
+                  continue
+              wanted.append(name)
+              for dep in package.get('%DEPENDS%', []):
+                  dep = re.split(r'[<>=]', dep, maxsplit=1)[0].strip()
+                  if dep:
+                      queue.append(dep)
+
+          root.mkdir(parents=True, exist_ok=True)
+          for name in wanted:
+              fields = index[name]
+              filename = fields['%FILENAME%'][0]
+              digest = fields['%SHA256SUM%'][0]
+              archive = root / filename
+              if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+                  print(f'download {filename}')
+                  archive.write_bytes(fetch(f'{REPO}/{filename}'))
+              if hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+                  sys.exit(f'checksum mismatch: {filename}')
+              subprocess.run(['tar', '--zstd', '-xf', str(archive), '-C', str(root)], check=True)
+              archive.unlink()
+          print(f'{len(wanted)} packages extracted to {root / "mingw64"}')
+          PY
+
+      - name: Windows JavaScriptCore from Playwright WebKit
+        run: |
+          mkdir -p "$RUNNER_TEMP/webkit"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/webkit.zip" \
+            "https://cdn.playwright.dev/dbazure/download/playwright/builds/webkit/${WEBKIT_REVISION}/webkit-win64.zip"
+          unzip -q "$RUNNER_TEMP/webkit.zip" -d "$RUNNER_TEMP/webkit"
+          test -f "$RUNNER_TEMP/webkit/JavaScriptCore.dll"
+          printf 'JSC=%s\n' "$RUNNER_TEMP/webkit/JavaScriptCore.dll" >> "$GITHUB_ENV"
+
+      - name: Cross-compile Vox.exe
+        run: |
+          unset CC CXX AR OBJDUMP DLLTOOL
+          sh tools/run_v_tool.sh build_windows_browser \
+            --deps-root "$DEPS" \
+            --javascriptcore-dll "$JSC" \
+            --output "$PWD/Vox.exe"
+
+      - name: Stage runtime DLLs
+        run: |
+          mkdir -p dist
+          cp Vox.exe dist/
+          # Every MinGW runtime and dependency DLL from the sysroot.
+          cp "$DEPS"/mingw64/bin/*.dll dist/
+          # The complete pinned Mesa set, including dxil.dll for the D3D12 driver.
+          cp "$DEPS"/mesa/release-mingw/x64/*.dll dist/
+          # JavaScriptCore with its matching ICU and MSVC runtime.
+          cp "$RUNNER_TEMP"/webkit/JavaScriptCore.dll \
+             "$RUNNER_TEMP"/webkit/icu*.dll \
+             "$RUNNER_TEMP"/webkit/msvcp140*.dll \
+             "$RUNNER_TEMP"/webkit/vcruntime140*.dll dist/
+          cat > dist/README-WINDOWS.txt <<'TXT'
+          Vox for Windows x86-64, cross-compiled from the Ubuntu runner.
+
+          Run Vox.exe from this folder and keep the DLLs beside it. Copying the
+          executable alone fails with 0xc0000135 (STATUS_DLL_NOT_FOUND).
+
+          The window host uses Direct3D 11. If Windows cannot create a hardware
+          D3D11 device (VMs, basic display adapters), it falls back to WARP
+          software rendering and every page is slow; that is a runtime/GPU
+          condition, not a build setting. WebGL goes through Mesa: the
+          opengl32.dll here must stay beside the executable and must not be
+          replaced by ANGLE's libEGL/libGLESv2.
+
+          Do not set GALLIUM_DRIVER=llvmpipe unless you want the software path.
+          TXT
+
+      - name: Verify the artifact is a Windows PE
+        run: |
+          file dist/Vox.exe
+          file dist/Vox.exe | grep -q 'PE32+'
+          test "$(head -c 2 dist/Vox.exe)" = MZ
+          sha256sum dist/Vox.exe | tee dist/SHA256SUMS.txt
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vox-windows-x64
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
