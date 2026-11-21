@@ -1,0 +1,177 @@
+name: windows-x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # V must match the revision the repository's Linux CI builds.
+      V_REVISION: 7ede4c6133d71f88ab99e68fd9626552e252ad3a
+      # Playwright WebKit build whose JavaScriptCore.dll is staged.
+      WEBKIT_REVISION: '2395'
+      DEPS: ${{ github.workspace }}/Build/deps/windows
+      CC: x86_64-w64-mingw32-gcc
+      CXX: x86_64-w64-mingw32-g++
+      AR: x86_64-w64-mingw32-ar
+      OBJDUMP: x86_64-w64-mingw32-objdump
+      DLLTOOL: x86_64-w64-mingw32-dlltool
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config mingw-w64 \
+            curl ca-certificates unzip zstd p7zip-full python3
+
+      - name: Swap for the single-file C build
+        run: |
+          sudo fallocate -l 8G "$RUNNER_TEMP/vox.swap"
+          sudo chmod 600 "$RUNNER_TEMP/vox.swap"
+          sudo mkswap "$RUNNER_TEMP/vox.swap"
+          sudo swapon "$RUNNER_TEMP/vox.swap"
+
+      - name: Build pinned V
+        run: |
+          git init "$RUNNER_TEMP/v"
+          git -C "$RUNNER_TEMP/v" remote add origin https://github.com/vlang/v.git
+          git -C "$RUNNER_TEMP/v" fetch --depth 1 origin "$V_REVISION"
+          git -C "$RUNNER_TEMP/v" checkout --detach FETCH_HEAD
+          make -C "$RUNNER_TEMP/v" -j"$(nproc)"
+          printf 'V_BIN=%s/v\n' "$RUNNER_TEMP/v" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/v" >> "$GITHUB_PATH"
+
+      - name: Install UI2
+        run: v install ui2
+
+      - name: Windows sysroot from MSYS2 packages
+        run: |
+          python3 - "$DEPS" <<'PY'
+          import hashlib, re, subprocess, sys, tempfile, urllib.request
+          from pathlib import Path
+
+          REPO = 'https://repo.msys2.org/mingw/mingw64'
+          SEEDS = ['mingw-w64-x86_64-icu', 'mingw-w64-x86_64-harfbuzz',
+                   'mingw-w64-x86_64-freetype', 'mingw-w64-x86_64-openssl',
+                   'mingw-w64-x86_64-curl']
+
+          def fetch(url, timeout=300):
+              request = urllib.request.Request(url, headers={'User-Agent': 'vox-ci'})
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  return response.read()
+
+          def load_index():
+              with tempfile.TemporaryDirectory() as scratch:
+                  db = Path(scratch) / 'mingw64.db'
+                  db.write_bytes(fetch(f'{REPO}/mingw64.db'))
+                  subprocess.run(['tar', '--zstd', '-xf', str(db), '-C', scratch], check=True)
+                  index = {}
+                  for desc in Path(scratch).glob('*/desc'):
+                      fields, name = {}, None
+                      for block in desc.read_text(errors='replace').split('\n\n'):
+                          lines = [line for line in block.splitlines() if line]
+                          if not lines:
+                              continue
+                          if lines[0] == '%NAME%':
+                              name = lines[1]
+                          fields[lines[0]] = lines[1:]
+                      if name:
+                          index[name] = fields
+                  return index
+
+          root = Path(sys.argv[1]).resolve()
+          index = load_index()
+          queue, wanted, seen = list(SEEDS), [], set()
+          while queue:
+              name = queue.pop(0)
+              if name in seen:
+                  continue
+              seen.add(name)
+              package = index.get(name)
+              if package is None:
+                  print(f'warning: {name} is not in the mingw64 repository')
+                  continue
+              wanted.append(name)
+              for dep in package.get('%DEPENDS%', []):
+                  dep = re.split(r'[<>=]', dep, maxsplit=1)[0].strip()
+                  if dep:
+                      queue.append(dep)
+
+          root.mkdir(parents=True, exist_ok=True)
+          for name in wanted:
+              fields = index[name]
+              filename = fields['%FILENAME%'][0]
+              digest = fields['%SHA256SUM%'][0]
+              archive = root / filename
+              if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+                  print(f'download {filename}')
+                  archive.write_bytes(fetch(f'{REPO}/{filename}'))
+              if hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+                  sys.exit(f'checksum mismatch: {filename}')
+              subprocess.run(['tar', '--zstd', '-xf', str(archive), '-C', str(root)], check=True)
+              archive.unlink()
+          print(f'{len(wanted)} packages extracted to {root / "mingw64"}')
+          PY
+
+      - name: Windows JavaScriptCore from Playwright WebKit
+        run: |
+          mkdir -p "$RUNNER_TEMP/webkit"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/webkit.zip" \
+            "https://cdn.playwright.dev/dbazure/download/playwright/builds/webkit/${WEBKIT_REVISION}/webkit-win64.zip"
+          unzip -q "$RUNNER_TEMP/webkit.zip" -d "$RUNNER_TEMP/webkit"
+          test -f "$RUNNER_TEMP/webkit/JavaScriptCore.dll"
+          printf 'JSC=%s\n' "$RUNNER_TEMP/webkit/JavaScriptCore.dll" >> "$GITHUB_ENV"
+
+      - name: Cross-compile Vox.exe
+        run: |
+          sh tools/run_v_tool.sh build_windows_browser \
+            --deps-root "$DEPS" \
+            --javascriptcore-dll "$JSC" \
+            --output "$PWD/Vox.exe"
+
+      - name: Stage runtime DLLs
+        run: |
+          mkdir -p dist
+          cp Vox.exe dist/
+          cp "$DEPS"/mingw64/bin/*.dll dist/
+          cp "$DEPS"/mesa/release-mingw/x64/libEGL.dll \
+             "$DEPS"/mesa/release-mingw/x64/libGLESv2.dll \
+             "$DEPS"/mesa/release-mingw/x64/libgallium_wgl.dll \
+             "$DEPS"/mesa/release-mingw/x64/opengl32.dll dist/
+          if [ -f "$DEPS"/mesa/release-mingw/x64/dxil.dll ]; then
+            cp "$DEPS"/mesa/release-mingw/x64/dxil.dll dist/
+          fi
+          cp "$RUNNER_TEMP"/webkit/JavaScriptCore.dll \
+             "$RUNNER_TEMP"/webkit/icu*.dll \
+             "$RUNNER_TEMP"/webkit/msvcp140*.dll \
+             "$RUNNER_TEMP"/webkit/vcruntime140*.dll dist/
+
+      - name: Verify the artifact is a Windows PE
+        run: |
+          file dist/Vox.exe
+          file dist/Vox.exe | grep -q 'PE32+'
+          test "$(head -c 2 dist/Vox.exe)" = MZ
+          sha256sum dist/Vox.exe | tee dist/SHA256SUMS.txt
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vox-windows-x64
+          path: dist/
+          if-no-files-found: error
