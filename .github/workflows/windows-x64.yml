@@ -1,3 +1,4 @@
+# .github/workflows/windows-x64.yml
 name: windows-x64
 
 on:
@@ -16,17 +17,13 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+
     env:
-      # V must match the revision the repository's Linux CI builds.
+      # V revision the repository's Linux CI builds.
       V_REVISION: 7ede4c6133d71f88ab99e68fd9626552e252ad3a
       # Playwright WebKit build whose JavaScriptCore.dll is staged.
       WEBKIT_REVISION: '2395'
       DEPS: ${{ github.workspace }}/Build/deps/windows
-      CC: x86_64-w64-mingw32-gcc
-      CXX: x86_64-w64-mingw32-g++
-      AR: x86_64-w64-mingw32-ar
-      OBJDUMP: x86_64-w64-mingw32-objdump
-      DLLTOOL: x86_64-w64-mingw32-dlltool
 
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +50,8 @@ jobs:
           git -C "$RUNNER_TEMP/v" remote add origin https://github.com/vlang/v.git
           git -C "$RUNNER_TEMP/v" fetch --depth 1 origin "$V_REVISION"
           git -C "$RUNNER_TEMP/v" checkout --detach FETCH_HEAD
-          make -C "$RUNNER_TEMP/v" -j"$(nproc)"
+          # CC=cc pins the host compiler; an inherited CC must not reach V's bootstrap.
+          make -C "$RUNNER_TEMP/v" CC=cc -j"$(nproc)"
           printf 'V_BIN=%s/v\n' "$RUNNER_TEMP/v" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/v" >> "$GITHUB_PATH"
 
@@ -140,6 +138,8 @@ jobs:
 
       - name: Cross-compile Vox.exe
         run: |
+          # The helper supplies the prefixed cross tools itself; clear any inherited ones.
+          unset CC CXX AR OBJDUMP DLLTOOL
           sh tools/run_v_tool.sh build_windows_browser \
             --deps-root "$DEPS" \
             --javascriptcore-dll "$JSC" \
